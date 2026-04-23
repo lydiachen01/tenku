@@ -94,7 +94,7 @@ class EPD:
         self._command(0x3C, b'\x80')
         self._command(0x21, b'\x00\x00')
         # no wait_until_idle — just register writes, no activation
-        self.wait_until_idle()
+        # CHANGE HERE self.wait_until_idle()
 
     def display_frame(self, frame_buffer):
         self._command(0x4E, b'\x00')
@@ -111,7 +111,7 @@ class EPD:
         # Previous frame → RAM 0x26
         self._command(0x4E, b'\x00')
         self._command(0x4F, b'\x00\x00')
-        self._command(0x26)
+        self._command(0x26) #The next data you receive should go into the previous image buffer (RAM 0x26)
         if self._prev_buf is not None:
             self._data(self._prev_buf)
         else:
@@ -120,10 +120,10 @@ class EPD:
         # New frame → RAM 0x24
         self._command(0x4E, b'\x00')
         self._command(0x4F, b'\x00\x00')
-        self._command(0x24)
+        self._command(0x24) #write this upcoming data
         self._data(frame_buffer)
 
-        self._command(0x22, b'\xCF')
+        self._command(0x22, b'\xCF') #update the display
         self._command(0x20)
         self.wait_until_idle()     # ← must not remove this
         self._prev_buf = bytearray(frame_buffer)
@@ -141,3 +141,84 @@ class EPD:
 
     def sleep(self):
         self._command(0x10, b'\x01')
+    
+    def display_frame_partial_window(self, frame_buffer, x, y, w, h):
+        """
+        Partial refresh of a rectangular region only.
+        x, w must be byte-aligned (multiples of 8).
+        frame_buffer must be exactly (w // 8) * h bytes —
+        only the pixels for the bounding box, not the full screen.
+        """
+        x_start = x // 8
+        x_end   = (x + w) // 8 - 1
+        y_start = y
+        y_end   = y + h - 1
+
+        # Set X window
+        self._command(0x44, bytearray([x_start, x_end]))
+        # Set Y window
+        self._command(0x45, bytearray([
+            y_start & 0xFF, (y_start >> 8) & 0xFF,
+            y_end   & 0xFF, (y_end   >> 8) & 0xFF,
+        ]))
+        # Set cursor to top-left of window
+        self._command(0x4E, bytearray([x_start]))
+        self._command(0x4F, bytearray([y_start & 0xFF, (y_start >> 8) & 0xFF]))
+
+        # Write previous frame data for the window region into RAM 0x26
+        self._command(0x26)
+        if self._prev_buf is not None:
+            self._data(self._extract_window(self._prev_buf, x, y, w, h))
+        else:
+            self._data(bytearray(b'\xff' * ((w // 8) * h)))
+
+        # Reset cursor, write new frame data into RAM 0x24
+        self._command(0x4E, bytearray([x_start]))
+        self._command(0x4F, bytearray([y_start & 0xFF, (y_start >> 8) & 0xFF]))
+        self._command(0x24)
+        self._data(frame_buffer)
+
+        self._command(0x22, b'\xCF')
+        self._command(0x20)
+        self.wait_until_idle()
+
+        # Patch _prev_buf so subsequent partial updates stay consistent
+        self._patch_window(self._prev_buf, frame_buffer, x, y, w, h)
+
+        # Restore full-screen window for next full/normal partial update
+        self._command(0x44, b'\x00\x31')
+        self._command(0x45, b'\x00\x00\x2B\x01')
+        self._command(0x4E, b'\x00')
+        self._command(0x4F, b'\x00\x00')
+
+    def _extract_window(self, full_buf, x, y, w, h):
+        """Pull a w x h rectangle out of a full 400x300 frame buffer."""
+        stride    = EPD_WIDTH // 8   # 50 bytes per row
+        win_stride = w // 8
+        out = bytearray(win_stride * h)
+        x_byte = x // 8
+        for row in range(h):
+            src = (y + row) * stride + x_byte
+            dst = row * win_stride
+            out[dst:dst + win_stride] = full_buf[src:src + win_stride]
+        return out
+
+    def _patch_window(self, full_buf, win_buf, x, y, w, h):
+        """Write a window buffer back into the correct position of full_buf."""
+        if full_buf is None:
+            return
+        stride     = EPD_WIDTH // 8
+        win_stride = w // 8
+        x_byte     = x // 8
+        for row in range(h):
+            dst = (y + row) * stride + x_byte
+            src = row * win_stride
+            full_buf[dst:dst + win_stride] = win_buf[src:src + win_stride]
+            
+    def clear_prev_buf(self):
+        """Reset the stored previous frame to all-white in-place."""
+        if self._prev_buf is not None:
+            for i in range(len(self._prev_buf)):
+                self._prev_buf[i] = 0xFF
+        else:
+            self._prev_buf = bytearray(b'\xff' * (self.width * self.height // 8))
