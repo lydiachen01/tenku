@@ -9,6 +9,7 @@ import framebuf
 import time
 import gc
 from epaper4in2_2 import EPD
+import sprites  # walk_0.png / walk_1.png converted via convert_sprites.py
  
 # ── Display config ────────────────────────────────────────────────────────────
 SCREEN_W     = 400
@@ -22,6 +23,22 @@ TEXT_H = SCREEN_H - (PADDING * 2)
  
 COLS = TEXT_W // CHAR_W   # 38
 ROWS = TEXT_H // CHAR_H   # 29
+ 
+# ── Sprite / walk page layout ─────────────────────────────────────────────────
+SPR_W = sprites.SPRITE_W   # 40
+SPR_H = sprites.SPRITE_H   # 40
+ 
+# Sprite centered vertically, left quarter of screen
+# x must be a multiple of 8
+SPR_X = 40                              # 40px from left edge
+SPR_Y = (SCREEN_H - SPR_H) // 2        # vertically centred = 130
+ 
+# Step counter text — centered in right half of screen
+STEP_TEXT_X = SCREEN_W // 2 + 16       # ~216px from left (multiple of 8)
+STEP_TEXT_Y = (SCREEN_H - CHAR_H) // 2 # vertically centred
+ 
+# Animation state
+_walk_frame = 0
  
 # ── SPI / display init ────────────────────────────────────────────────────────
 spi  = SoftSPI(baudrate=2000000, polarity=0, phase=0,
@@ -40,28 +57,25 @@ print("Display ready.")
 # ── Button init ───────────────────────────────────────────────────────────────
 btn_next     = Pin(32, Pin.IN, Pin.PULL_UP)
 btn_prev     = Pin(33, Pin.IN, Pin.PULL_UP)
-btn_settings = Pin(4, Pin.IN, Pin.PULL_UP)  
+btn_settings = Pin(4,  Pin.IN, Pin.PULL_UP)
  
 # ── I2C / LSM6DS3 init ────────────────────────────────────────────────────────
 i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
  
-LSM6DS3_ADDR       = 0x6B   # or 0x6A if SA0 is low
+LSM6DS3_ADDR       = 0x6B
 LSM6DS3_WHO_AM_I   = 0x0F
-LSM6DS3_CTRL1_XL   = 0x10   # accel control
-LSM6DS3_STEP_CTR_L = 0x4B   # step count low byte
-LSM6DS3_STEP_CTR_H = 0x4C   # step count high byte
-LSM6DS3_TAP_CFG    = 0x58   # enable pedometer
-LSM6DS3_CTRL10_C   = 0x19   # enable step counter/pedometer func
+LSM6DS3_CTRL1_XL   = 0x10
+LSM6DS3_STEP_CTR_L = 0x4B
+LSM6DS3_STEP_CTR_H = 0x4C
+LSM6DS3_TAP_CFG    = 0x58
+LSM6DS3_CTRL10_C   = 0x19
  
 def lsm6ds3_init():
     try:
         who = i2c.readfrom_mem(LSM6DS3_ADDR, LSM6DS3_WHO_AM_I, 1)
-        print("LSM6DS3 WHO_AM_I: 0x{:02X}".format(who[0]))  # expect 0x69
-        # Set accel to 26 Hz, ±2g
+        print("LSM6DS3 WHO_AM_I: 0x{:02X}".format(who[0]))
         i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_CTRL1_XL, bytes([0x20]))
-        # Enable pedometer in TAP_CFG (bit 6 = TIMER_EN, bit 4 = PEDO_EN)
         i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_TAP_CFG,  bytes([0x40]))
-        # Enable step counter (bit 3 = PEDO_RST_STEP=0, bit 2 = FUNC_EN=1)
         i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_CTRL10_C, bytes([0x04]))
         print("LSM6DS3 pedometer enabled.")
         return True
@@ -169,8 +183,6 @@ def render_settings(selected_idx):
  
     title = "-- SETTINGS --"
     fb.text(title, PADDING, PADDING, 0x00)
- 
-    # Divider line
     fb.hline(PADDING, PADDING + CHAR_H + 4, SCREEN_W - PADDING * 2, 0x00)
  
     for i, option in enumerate(SETTINGS_OPTIONS):
@@ -179,57 +191,102 @@ def render_settings(selected_idx):
         fb.text(cursor + option, PADDING, y, 0x00)
  
     hint = "UP/DN: navigate  SET: select"
-    fb.text(hint,
-            PADDING,
-            SCREEN_H - CHAR_H - 4,
-            0x00)
+    fb.text(hint, PADDING, SCREEN_H - CHAR_H - 4, 0x00)
  
     epd.display_frame(buf)
     del buf
     gc.collect()
  
-# ── Walk page renderer ────────────────────────────────────────────────────────
-def render_walk_page(steps):
-    """Display the current step count on a full-screen walking page."""
+# ── Walk page ─────────────────────────────────────────────────────────────────
+def render_walk_page_full(steps):
+    """
+    First entry into walk mode — draw the full static layout:
+    title, divider, hint text. Then layer sprite and step count
+    on top via windowed partial updates.
+    """
     buf = bytearray(BUF_SIZE)
     fb  = framebuf.FrameBuffer(buf, SCREEN_W, SCREEN_H, framebuf.MONO_HLSB)
     fb.fill(0xFF)
  
-    title = "WALK MODE"
-    fb.text(title, PADDING, PADDING, 0x00)
+    fb.text("WALK MODE", PADDING, PADDING, 0x00)
     fb.hline(PADDING, PADDING + CHAR_H + 4, SCREEN_W - PADDING * 2, 0x00)
  
-    if steps < 0:
-        step_str = "Sensor error"
-        print("curr steps", steps)
-    else:
-        step_str = "Steps: {}".format(steps)
+    # Vertical divider between sprite side and step count side
+    fb.vline(SCREEN_W // 2, PADDING + CHAR_H + 8,
+             SCREEN_H - PADDING * 2 - CHAR_H - 12, 0x00)
  
-    # Draw step count large-ish by repeating text scaled manually
-    # (MicroPython framebuf has no font scaling, so we tile 2x manually)
-    label_x = PADDING
-    label_y = SCREEN_H // 2 - CHAR_H
-    for dy in range(2):
-        for dx in range(2):
-            fb.text(step_str, label_x + dx, label_y + dy, 0x00)
- 
-    hint = "NEXT/PREV: refresh  LONG SET: menu"
-    fb.text(hint, PADDING, SCREEN_H - CHAR_H - 4, 0x00)
- 
-    epd.display_frame_partial(buf)
+    fb.text("NEXT/PREV: refresh  LONG SET: menu",
+            PADDING, SCREEN_H - CHAR_H - 4, 0x00)
+    epd.display_frame(buf)   # full refresh — establishes _prev_buf in driver
     del buf
     gc.collect()
+    epd.clear_prev_buf()
+    # Overlay sprite and step count via windowed partials
+    _render_sprite_window(0)
+    _render_step_window(steps)
+ 
+ 
+def _render_sprite_window(frame_idx):
+    """Push just the 40x40 sprite bounding box as a windowed partial update."""
+    win_buf = bytearray(sprites.FRAMES[frame_idx])  # copy so we don't mutate
+    epd.display_frame_partial_window(win_buf, SPR_X, SPR_Y, SPR_W, SPR_H)
+    del win_buf
+    gc.collect()
+ 
+ 
+def _render_step_window(steps):
+    """
+    Push just the step counter text region as a windowed partial update.
+    Wide enough for 'Steps: 65535' (13 chars × 10px = 130 → rounded to 136).
+    x must be a multiple of 8 — STEP_TEXT_X=216 satisfies this.
+    """
+    WIN_W = 136   # multiple of 8, fits longest step string
+    WIN_H = CHAR_H * 2 + 4   # two text rows + padding = 24px
+    WIN_X = STEP_TEXT_X       # 216
+    WIN_Y = STEP_TEXT_Y - 2
+ 
+    win_buf = bytearray((WIN_W // 8) * WIN_H)
+    fb = framebuf.FrameBuffer(win_buf, WIN_W, WIN_H, framebuf.MONO_HLSB)
+    fb.fill(0xFF)
+ 
+    if steps < 0:
+        line1 = "Sensor"
+        line2 = "error"
+        print("curr steps", steps)
+    else:
+        line1 = "Steps:"
+        line2 = str(steps)
+ 
+    fb.text(line1, 0, 0,           0x00)
+    fb.text(line2, 0, CHAR_H + 2,  0x00)
+ 
+    epd.display_frame_partial_window(win_buf, WIN_X, WIN_Y, WIN_W, WIN_H)
+    del win_buf
+    gc.collect()
+ 
+ 
+def render_walk_update(steps): #NOTE: ERROR NOT HERE
+    """
+    Called on each button press in walk mode.
+    Advances animation frame and refreshes only the two bounding boxes.
+    """
+    global _walk_frame
+    print("IN UPDATE WALK FRAME")
+    _walk_frame = (_walk_frame + 1) % len(sprites.FRAMES)
+    _render_sprite_window(_walk_frame)
+    print("AFTER RENDER SPRITE")
+    _render_step_window(steps)
+    print("AFTER RENDER STEP")
  
 # ── Button helpers ────────────────────────────────────────────────────────────
 DEBOUNCE_MS      = 200
-LONG_PRESS_MS    = 700   # hold for 700 ms to trigger long-press
+LONG_PRESS_MS    = 700
  
 last_press_next  = 0
 last_press_prev  = 0
 last_press_set   = 0
  
 def button_pressed(pin, last_ref):
-    """Returns (True, now) on a debounced falling edge, else (False, last_ref)."""
     if pin.value() == 0:
         now = time.ticks_ms()
         if time.ticks_diff(now, last_ref) > DEBOUNCE_MS:
@@ -237,11 +294,6 @@ def button_pressed(pin, last_ref):
     return False, last_ref
  
 def detect_settings_press():
-    """
-    Block until GPIO 4 is released, then classify the press.
-    Returns 'long' or 'short'.
-    Called only after we already detect the button is LOW.
-    """
     t_down = time.ticks_ms()
     while btn_settings.value() == 0:
         time.sleep_ms(10)
@@ -273,7 +325,7 @@ print("\nReady. Long-press SETTINGS to open menu.")
  
 # ── State ─────────────────────────────────────────────────────────────────────
 mode         = MODE_READ
-settings_idx = 0   # which settings option is highlighted
+settings_idx = 0
  
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
@@ -286,14 +338,12 @@ while True:
             press_type = detect_settings_press()
  
             if press_type == "long":
-                # Enter settings menu from any mode
                 mode = MODE_SETTINGS
-                settings_idx = 0 if mode != MODE_WALK else 1
+                settings_idx = 0
                 print("Opening settings menu")
                 render_settings(settings_idx)
  
             elif press_type == "short" and mode == MODE_SETTINGS:
-                # Confirm selection
                 chosen = SETTINGS_OPTIONS[settings_idx]
                 print("Selected:", chosen)
                 if chosen == "READ":
@@ -302,9 +352,10 @@ while True:
                     current = 0
                     render_page(pages[current], current, total, full=True)
                 elif chosen == "WALK":
-                    mode  = MODE_WALK
-                    steps = lsm6ds3_steps()
-                    render_walk_page(steps)
+                    mode        = MODE_WALK
+                    _walk_frame = 0
+                    steps       = lsm6ds3_steps()
+                    render_walk_page_full(steps)
  
     # ── NEXT button ───────────────────────────────────────────────────────────
     pressed, last_press_next = button_pressed(btn_next, last_press_next)
@@ -318,9 +369,7 @@ while True:
         elif mode == MODE_WALK:
             steps = lsm6ds3_steps()
             print("Refreshing steps:", steps)
-            i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
-            print("i2c scan", i2c.scan())
-            render_walk_page(steps)
+            render_walk_update(steps)
  
         elif mode == MODE_SETTINGS:
             settings_idx = (settings_idx + 1) % len(SETTINGS_OPTIONS)
@@ -338,7 +387,7 @@ while True:
         elif mode == MODE_WALK:
             steps = lsm6ds3_steps()
             print("Refreshing steps:", steps)
-            render_walk_page(steps)
+            render_walk_update(steps)
  
         elif mode == MODE_SETTINGS:
             settings_idx = (settings_idx - 1) % len(SETTINGS_OPTIONS)
