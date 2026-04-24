@@ -1,26 +1,46 @@
 # main.py — Pride & Prejudice e-Paper Reader
 # Waveshare 4.2" e-Paper V2 via ESP32 Driver Board
 # Buttons on GPIO 32 (next page) and GPIO 33 (prev page)
-
-from machine import Pin, SoftSPI
+# Settings button on GPIO 4 (long press = open settings, short press = select)
+# LSM6DS3 accelerometer/step counter on I2C GPIO 21 (SDA), 22 (SCL)
+ 
+from machine import Pin, SoftSPI, I2C
 import framebuf
 import time
 import gc
 from epaper4in2_2 import EPD
-
+import sprites  # walk_0.png / walk_1.png converted via convert_sprites.py
+from time import sleep_ms
+ 
 # ── Display config ────────────────────────────────────────────────────────────
 SCREEN_W     = 400
 SCREEN_H     = 300
 PADDING      = 8
 CHAR_W       = 10
 CHAR_H       = 10
-
+ 
 TEXT_W = SCREEN_W - (PADDING * 2)
 TEXT_H = SCREEN_H - (PADDING * 2)
-
+ 
 COLS = TEXT_W // CHAR_W   # 38
 ROWS = TEXT_H // CHAR_H   # 29
-
+ 
+# ── Sprite / walk page layout ─────────────────────────────────────────────────
+SPR_W = sprites.SPRITE_W   # 40
+SPR_H = sprites.SPRITE_H   # 40
+ 
+# Sprite centered vertically, left quarter of screen
+# x must be a multiple of 8
+SPR_X = 40                              # 40px from left edge
+SPR_Y = (SCREEN_H - SPR_H) // 2        # vertically centred = 130
+ 
+# Step counter text — centered in right half of screen
+STEP_TEXT_X = SCREEN_W // 2 + 16       # ~216px from left (multiple of 8)
+STEP_TEXT_Y = (SCREEN_H - CHAR_H) // 2 # vertically centred
+ 
+# Animation state
+_walk_frame = 0
+ 
 # ── SPI / display init ────────────────────────────────────────────────────────
 spi  = SoftSPI(baudrate=2000000, polarity=0, phase=0,
                sck=Pin(13), mosi=Pin(14), miso=Pin(12))
@@ -28,18 +48,51 @@ cs   = Pin(15)
 dc   = Pin(27)
 rst  = Pin(26)
 busy = Pin(25)
-
+ 
 print("Initialising display...")
 epd = EPD(spi, cs, dc, rst, busy)
 epd.init()
 epd.clear()
-epd.init()
 print("Display ready.")
-
+ 
 # ── Button init ───────────────────────────────────────────────────────────────
-btn_next = Pin(32, Pin.IN, Pin.PULL_UP)
-btn_prev = Pin(33, Pin.IN, Pin.PULL_UP)
-
+btn_next     = Pin(32, Pin.IN, Pin.PULL_UP)
+btn_prev     = Pin(33, Pin.IN, Pin.PULL_UP)
+btn_settings = Pin(4,  Pin.IN, Pin.PULL_UP)
+ 
+# ── I2C / LSM6DS3 init ────────────────────────────────────────────────────────
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+ 
+LSM6DS3_ADDR       = 0x6B
+LSM6DS3_WHO_AM_I   = 0x0F
+LSM6DS3_CTRL1_XL   = 0x10
+LSM6DS3_STEP_CTR_L = 0x4B
+LSM6DS3_STEP_CTR_H = 0x4C
+LSM6DS3_TAP_CFG    = 0x58
+LSM6DS3_CTRL10_C   = 0x19
+ 
+def lsm6ds3_init():
+    try:
+        who = i2c.readfrom_mem(LSM6DS3_ADDR, LSM6DS3_WHO_AM_I, 1)
+        print("LSM6DS3 WHO_AM_I: 0x{:02X}".format(who[0]))
+        i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_CTRL1_XL, bytes([0x20]))
+        i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_TAP_CFG,  bytes([0x40]))
+        i2c.writeto_mem(LSM6DS3_ADDR, LSM6DS3_CTRL10_C, bytes([0x04]))
+        print("LSM6DS3 pedometer enabled.")
+        return True
+    except Exception as e:
+        print("LSM6DS3 init failed:", e)
+        return False
+ 
+def lsm6ds3_steps():
+    try:
+        lo = i2c.readfrom_mem(LSM6DS3_ADDR, LSM6DS3_STEP_CTR_L, 1)[0]
+        hi = i2c.readfrom_mem(LSM6DS3_ADDR, LSM6DS3_STEP_CTR_H, 1)[0]
+        return (hi << 8) | lo
+    except Exception as e:
+        print("LSM6DS3 read failed:", e)
+        return -1
+ 
 # ── Profiling ─────────────────────────────────────────────────────────────────
 def profile_memory(label):
     gc.collect()
@@ -49,28 +102,20 @@ def profile_memory(label):
     print("[MEM] {:30s} free={:6d}  used={:6d}  total={:6d}".format(
         label, free, alloc, total))
     return free, alloc
-
-def profile_time(label, fn):
-    """Call fn(), print how long it took, return its result."""
-    t0 = time.ticks_ms()
-    result = fn()
-    elapsed = time.ticks_diff(time.ticks_ms(), t0)
-    print("[TIME] {:30s} {}ms".format(label, elapsed))
-    return result
-
+ 
 # ── Text pagination ───────────────────────────────────────────────────────────
 def build_pages(filepath):
     print("Reading file:", filepath)
     with open(filepath, "r") as f:
         raw = f.read()
-
+ 
     raw = raw.replace("\r\n", " ").replace("\n", " ").replace("\t", " ")
     words = [w for w in raw.split(" ") if w]
-
+ 
     pages = []
     current_lines = []
     current_line  = ""
-
+ 
     for word in words:
         if len(word) > COLS:
             word = word[:COLS]
@@ -83,18 +128,18 @@ def build_pages(filepath):
             if len(current_lines) >= ROWS:
                 pages.append(current_lines[:ROWS])
                 current_lines = []
-
+ 
     if current_line:
         current_lines.append(current_line)
     if current_lines:
         pages.append(current_lines)
-
+ 
     print("Total pages:", len(pages))
     return pages
-
+ 
 # ── Rendering ─────────────────────────────────────────────────────────────────
-BUF_SIZE = SCREEN_W * SCREEN_H // 8   # bytes — always 15000 for 400x300
-
+BUF_SIZE = SCREEN_W * SCREEN_H // 8   # 15000 bytes for 400x300
+ 
 def build_frame(page_lines, page_num, total_pages):
     buf = bytearray(BUF_SIZE)
     fb  = framebuf.FrameBuffer(buf, SCREEN_W, SCREEN_H, framebuf.MONO_HLSB)
@@ -107,88 +152,255 @@ def build_frame(page_lines, page_num, total_pages):
             SCREEN_H - CHAR_H - 2,
             0x00)
     return buf
-
-
+ 
 def render_page(page_lines, page_num, total_pages, full=False):
     mode = "full" if full else "partial"
     print("\n--- render_page {}/{} ({}) ---".format(page_num + 1, total_pages, mode))
-
-    # Memory before frame build
     profile_memory("before build_frame")
-
-    # Time the frame build
-    t0 = time.ticks_ms()
+    t0  = time.ticks_ms()
     buf = build_frame(page_lines, page_num, total_pages)
     build_ms = time.ticks_diff(time.ticks_ms(), t0)
-
-    # Memory after frame build (buf is now allocated)
     profile_memory("after  build_frame")
-    print("[SIZE] frame buffer               {} bytes ({} KB)".format(
-        len(buf), len(buf) // 1024))
-    print("[TIME] build_frame                {}ms".format(build_ms))
-
-    # Time the display write
+    print("[TIME] build_frame {}ms".format(build_ms))
     t0 = time.ticks_ms()
     if full:
-        #epd.init()
         epd.display_frame(buf)
     else:
         epd.display_frame_partial(buf)
-    display_ms = time.ticks_diff(time.ticks_ms(), t0)
-
-    print("[TIME] display write+wait         {}ms".format(display_ms))
-    print("[TIME] total                      {}ms".format(build_ms + display_ms))
-
-    # Memory after display (buf can now be GC'd if nothing holds a reference)
+    print("[TIME] display write+wait {}ms".format(time.ticks_diff(time.ticks_ms(), t0)))
     del buf
     gc.collect()
     profile_memory("after  display (buf freed)")
+ 
+# ── Settings page renderer ────────────────────────────────────────────────────
+SETTINGS_OPTIONS = ["READ", "WALK"]
+ 
+def render_settings(selected_idx):
+    """Draw the settings menu with a cursor next to the selected option."""
+    
+    buf = bytearray(BUF_SIZE)
+    fb  = framebuf.FrameBuffer(buf, SCREEN_W, SCREEN_H, framebuf.MONO_HLSB)
+    fb.fill(0xFF)
+ 
+    title = "-- SETTINGS --"
+    fb.text(title, PADDING, PADDING, 0x00)
+    fb.hline(PADDING, PADDING + CHAR_H + 4, SCREEN_W - PADDING * 2, 0x00)
+ 
+    for i, option in enumerate(SETTINGS_OPTIONS):
+        y = PADDING + CHAR_H * 3 + i * (CHAR_H + 6)
+        cursor = "> " if i == selected_idx else "  "
+        fb.text(cursor + option, PADDING, y, 0x00)
+ 
+    hint = "UP/DN: navigate  SET: select"
+    fb.text(hint, PADDING, SCREEN_H - CHAR_H - 4, 0x00)
+ 
+    epd.display_frame(buf)
+    del buf
+    gc.collect()
+ 
+# ── Walk page ─────────────────────────────────────────────────────────────────
+def render_walk_page_full(steps):
+    buf = bytearray(BUF_SIZE)
+    fb  = framebuf.FrameBuffer(buf, SCREEN_W, SCREEN_H, framebuf.MONO_HLSB)
+    fb.fill(0xFF)
 
-# ── Button debounce ───────────────────────────────────────────────────────────
-DEBOUNCE_MS     = 200
-last_press_next = 0
-last_press_prev = 0
+    fb.text("WALK MODE", PADDING, PADDING, 0x00)
+    fb.hline(PADDING, PADDING + CHAR_H + 4, SCREEN_W - PADDING * 2, 0x00)
+    fb.vline(SCREEN_W // 2, PADDING + CHAR_H + 8,
+             SCREEN_H - PADDING * 2 - CHAR_H - 28, 0x00)
+    fb.text("NEXT/PREV: refresh  LONG SET: menu",
+            PADDING, SCREEN_H - CHAR_H - 4, 0x00)
 
+    epd.display_frame(buf)
+    # Do NOT call clear_prev_buf() here.
+    # _prev_buf = walk layout, RAM 0x26 = walk layout (set by display_frame).
+    # Windowed partials will correctly diff sprite/steps against this background.
+    del buf
+    gc.collect()
+    _render_sprite_window(0)
+    print("SPRITE LENGTH", len(sprites.FRAMES[0]))
+    sleep_ms(1000)  
+    _render_step_window(steps)
+ 
+ 
+def _render_sprite_window(frame_idx):
+    win_buf = bytearray(sprites.FRAMES[frame_idx])
+    
+    # Find which row in win_buf actually has ink
+    for row in range(SPR_H):
+        row_bytes = list(win_buf[row*5:(row*5)+5])
+        if any(b != 0xFF for b in row_bytes):
+            print("Sprite ink at win_buf row {}: {}".format(row, row_bytes))
+            # Where should this end up in _prev_buf?
+            expected_idx = (SPR_Y + row) * 50 + (SPR_X // 8)
+            print("Should patch _prev_buf at byte index:", expected_idx)
+            break
+    
+    epd.display_frame_partial_window(win_buf, SPR_X, SPR_Y, SPR_W, SPR_H)
+    
+    # Check that exact location after patch
+    expected_idx = (SPR_Y + 2) * 50 + (SPR_X // 8)  # row 2 of sprite = screen row 132
+    print("_prev_buf at expected patch location:", list(epd._prev_buf[expected_idx:expected_idx+5]))
+    del win_buf
+    gc.collect()
+    print("After GC, _prev_buf id:", id(epd._prev_buf))
+    print("After GC, _prev_buf[6655]:", list(epd._prev_buf[6655:6660]))
+ 
+ 
+def _render_step_window(steps):
+    # NO epd.init() here — it issues SW_RESET which wipes the partial LUT
+    # loaded by display_frame() and destroys _prev_buf coherence, causing
+    # the darkening and blank steps you observed.
+    WIN_W = 136
+    WIN_H = CHAR_H * 2 + 4
+    WIN_X = STEP_TEXT_X
+    WIN_Y = STEP_TEXT_Y - 2
+
+    win_buf = bytearray((WIN_W // 8) * WIN_H)
+    fb = framebuf.FrameBuffer(win_buf, WIN_W, WIN_H, framebuf.MONO_HLSB)
+    fb.fill(0xFF)
+
+    if steps < 0:
+        line1 = "Sensor"
+        line2 = "error"
+        print("curr steps", steps)
+    else:
+        line1 = "Steps:"
+        line2 = str(steps)
+
+    fb.text(line1, 0, 0,          0x00)
+    fb.text(line2, 0, CHAR_H + 2, 0x00)
+    print(line1, line2, "steps should have been on screen")
+
+    epd.display_frame_partial_window(win_buf, WIN_X, WIN_Y, WIN_W, WIN_H)
+    del win_buf
+    gc.collect()
+ 
+ 
+def render_walk_update(steps):
+    """
+    Called on each button press in walk mode.
+    Advances animation frame and refreshes only the two bounding boxes.
+    """
+    global _walk_frame
+    print("IN UPDATE WALK FRAME")
+    _walk_frame = (_walk_frame + 1) % len(sprites.FRAMES)
+    _render_sprite_window(_walk_frame)
+    _render_step_window(steps)
+ 
+# ── Button helpers ────────────────────────────────────────────────────────────
+DEBOUNCE_MS      = 200
+LONG_PRESS_MS    = 700
+ 
+last_press_next  = 0
+last_press_prev  = 0
+last_press_set   = 0
+ 
 def button_pressed(pin, last_ref):
     if pin.value() == 0:
         now = time.ticks_ms()
         if time.ticks_diff(now, last_ref) > DEBOUNCE_MS:
             return True, now
     return False, last_ref
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+ 
+def detect_settings_press():
+    t_down = time.ticks_ms()
+    while btn_settings.value() == 0:
+        time.sleep_ms(5)
+    held = time.ticks_diff(time.ticks_ms(), t_down)
+    return "long" if held >= LONG_PRESS_MS else "short"
+ 
+# ── App modes ─────────────────────────────────────────────────────────────────
+MODE_READ     = "read"
+MODE_WALK     = "walk"
+MODE_SETTINGS = "settings"
+ 
+# ── Startup ───────────────────────────────────────────────────────────────────
 profile_memory("startup")
-
+ 
+accel_ok = lsm6ds3_init()
+ 
 print("Building pages...")
-t0 = time.ticks_ms()
+t0    = time.ticks_ms()
 pages = build_pages("/sample.txt")
-print("[TIME] build_pages                {}ms".format(time.ticks_diff(time.ticks_ms(), t0)))
+print("[TIME] build_pages {}ms".format(time.ticks_diff(time.ticks_ms(), t0)))
 profile_memory("after build_pages")
-
+ 
 total   = len(pages)
 current = 0
-
-# Also report _prev_buf size in the driver (stored after first display_frame)
-print("[SIZE] _prev_buf in driver        {} bytes (allocated after first render)".format(
-    SCREEN_W * SCREEN_H // 8))
-
+ 
 print("\nRendering first page...")
 render_page(pages[current], current, total, full=True)
-print("\nReady. Use buttons to turn pages.")
-
+print("\nReady. Long-press SETTINGS to open menu.")
+ 
+# ── State ─────────────────────────────────────────────────────────────────────
+mode         = MODE_READ
+settings_idx = 0
+ 
+# ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
+ 
+    # ── Settings button ───────────────────────────────────────────────────────
+    if btn_settings.value() == 0:
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_press_set) > DEBOUNCE_MS:
+            last_press_set = now
+            press_type = detect_settings_press()
+ 
+            if press_type == "long":
+                mode = MODE_SETTINGS
+                settings_idx = 0
+                print("Opening settings menu")
+                render_settings(settings_idx)
+ 
+            elif press_type == "short" and mode == MODE_SETTINGS:
+                chosen = SETTINGS_OPTIONS[settings_idx]
+                print("Selected:", chosen)
+                if chosen == "READ":
+                    epd.init()
+                    mode    = MODE_READ
+                    current = 0
+                    render_page(pages[current], current, total, full=True)
+                elif chosen == "WALK":
+                    mode        = MODE_WALK
+                    _walk_frame = 0
+                    steps       = lsm6ds3_steps()
+                    render_walk_page_full(steps)
+ 
+    # ── NEXT button ───────────────────────────────────────────────────────────
     pressed, last_press_next = button_pressed(btn_next, last_press_next)
     if pressed:
-        if current < total - 1:
-            current += 1
-            print("→ Page", current + 1)
-            render_page(pages[current], current, total, full=False)
-
+        if mode == MODE_READ:
+            if current < total - 1:
+                current += 1
+                print("→ Page", current + 1)
+                render_page(pages[current], current, total, full=False)
+ 
+        elif mode == MODE_WALK:
+            steps = lsm6ds3_steps()
+            print("Refreshing steps:", steps)
+            render_walk_update(steps)
+ 
+        elif mode == MODE_SETTINGS:
+            settings_idx = (settings_idx + 1) % len(SETTINGS_OPTIONS)
+            render_settings(settings_idx)
+ 
+    # ── PREV button ───────────────────────────────────────────────────────────
     pressed, last_press_prev = button_pressed(btn_prev, last_press_prev)
     if pressed:
-        if current > 0:
-            current -= 1
-            print("← Page", current + 1)
-            render_page(pages[current], current, total, full=False)
-
-    time.sleep_ms(50)
+        if mode == MODE_READ:
+            if current > 0:
+                current -= 1
+                print("← Page", current + 1)
+                render_page(pages[current], current, total, full=False)
+ 
+        elif mode == MODE_WALK:
+            steps = lsm6ds3_steps()
+            print("Refreshing steps:", steps)
+            render_walk_update(steps)
+ 
+        elif mode == MODE_SETTINGS:
+            settings_idx = (settings_idx - 1) % len(SETTINGS_OPTIONS)
+            render_settings(settings_idx)
+ 
+    time.sleep_ms(10)

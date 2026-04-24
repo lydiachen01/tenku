@@ -97,15 +97,27 @@ class EPD:
         # CHANGE HERE self.wait_until_idle()
 
     def display_frame(self, frame_buffer):
+        self._command(0x3C, b'\x05')
+        self._command(0x21, b'\x40\x00')
+
+        # RAM 0x24 — new frame
         self._command(0x4E, b'\x00')
         self._command(0x4F, b'\x00\x00')
         self._command(0x24)
         self._data(frame_buffer)
+
+        # RAM 0x26 — same frame (so hardware "previous" matches what's on screen)
+        self._command(0x4E, b'\x00')
+        self._command(0x4F, b'\x00\x00')
+        self._command(0x26)
+        self._data(frame_buffer)  # ← walk layout, not white
+
         self._command(0x22, b'\xF7')
         self._command(0x20)
         self.wait_until_idle()
         self._prev_buf = bytearray(frame_buffer)
-        self._load_partial_lut()   # ← pre-load LUT once, stays loaded
+        self._load_partial_lut()
+        sleep_ms(100)
 
     def display_frame_partial(self, frame_buffer):
         # Previous frame → RAM 0x26
@@ -204,21 +216,35 @@ class EPD:
         return out
 
     def _patch_window(self, full_buf, win_buf, x, y, w, h):
-        """Write a window buffer back into the correct position of full_buf."""
+        print("_patch_window full_buf id:", id(full_buf))
+        print("self._prev_buf id:", id(self._prev_buf))
         if full_buf is None:
+            print("_patch_window: full_buf is None, aborting")
             return
-        stride     = EPD_WIDTH // 8
+        stride     = EPD_WIDTH // 8  # 50
         win_stride = w // 8
         x_byte     = x // 8
+        print("_patch_window: x={} y={} w={} h={} x_byte={} win_stride={}".format(x,y,w,h,x_byte,win_stride))
         for row in range(h):
             dst = (y + row) * stride + x_byte
             src = row * win_stride
+            if any(b != 0xFF for b in win_buf[src:src+win_stride]):
+                print("  ink row {}: src={} dst={} data={}".format(row, src, dst, list(win_buf[src:src+win_stride])))
             full_buf[dst:dst + win_stride] = win_buf[src:src + win_stride]
+        print("_patch_window done, checking dst 6655:", list(full_buf[6655:6660]))
             
     def clear_prev_buf(self):
-        """Reset the stored previous frame to all-white in-place."""
+        """Reset stored previous frame AND hardware RAM 0x26 to all-white."""
         if self._prev_buf is not None:
             for i in range(len(self._prev_buf)):
                 self._prev_buf[i] = 0xFF
         else:
             self._prev_buf = bytearray(b'\xff' * (self.width * self.height // 8))
+
+        # Flush white into controller RAM 0x26 so hardware state matches _prev_buf
+        self._command(0x4E, b'\x00')
+        self._command(0x4F, b'\x00\x00')
+        self._command(0x26)
+        white = bytearray(b'\xff' * (EPD_WIDTH // 8))
+        for _ in range(EPD_HEIGHT):
+            self._data(white)
